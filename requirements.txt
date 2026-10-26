@@ -1,0 +1,4 @@
+# The SDK (storage, NODE_CONTEXT, secrets), pinned to one release. Change the version in the link to upgrade.
+cbr-pipeline-sdk @ https://github.com/datakaveri/cbr-pipeline-sdk/releases/download/v2.2.0/cbr_pipeline_sdk-2.2.0-py3-none-any.whl
+# Reads CSV / JSON and writes Parquet.
+duckdb==1.1.3

@@ -1,0 +1,272 @@
+"""Tests for the platform file source node against a mock login + file server.
+
+The mock follows the documented platform calls:
+  POST /auth/.../token                     (password login -> access_token)
+  POST /v1/databanks/{id}/files            (list, Bearer token)
+  POST /v1/databanks/{id}/files/download   (-> data.presignedUrl, Bearer token)
+  GET  /blob/{key}                         (the pre-signed link, no token)
+
+Run inside the node's image:  python -m unittest discover -s tests -v
+"""
+
+import io
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.parse
+from contextlib import redirect_stdout
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from unittest import mock
+
+import duckdb
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from pipeline_sdk import util  # noqa: E402
+
+import main  # noqa: E402
+
+USER, PASSWORD = "tester@example.org", "s3cret-Pass!word"
+DATABANK = "11111111-2222-3333-4444-555555555555"
+CSV = b"id,name,age\n1,Asha,34\n2,Ravi,41\n3,Meera,29\n"
+JSONL = b'{"id":1,"city":"Bengaluru"}\n{"id":2,"city":"Mysuru"}\n'
+
+
+class State:
+    def reset(self):
+        self.tokens_issued = 0
+        self.valid_token = None
+        self.expire_next_token = False  # the first token answers 401 once, as an expired one would
+        self.files = {"people.csv": CSV}
+        self.requests = []
+        self.link_expired = False
+
+
+STATE = State()
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _reply(self, code, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _body(self):
+        raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        return raw.decode()
+
+    def _authorised(self):
+        return STATE.valid_token is not None and self.headers.get("Authorization") == f"Bearer {STATE.valid_token}"
+
+    def do_POST(self):
+        STATE.requests.append(self.path)
+        body = self._body()
+        if self.path.endswith("/protocol/openid-connect/token"):
+            form = urllib.parse.parse_qs(body)
+            ok = (
+                form.get("grant_type") == ["password"]
+                and form.get("client_id") == [main.CLIENT_ID]
+                and form.get("username") == [USER]
+                and form.get("password") == [PASSWORD]
+            )
+            if not ok:
+                return self._reply(401, {"error": "invalid_grant", "error_description": "Invalid user credentials"})
+            STATE.tokens_issued += 1
+            STATE.valid_token = f"token-{STATE.tokens_issued}"
+            return self._reply(200, {"access_token": STATE.valid_token, "expires_in": 300})
+        if STATE.expire_next_token and STATE.tokens_issued == 1:
+            STATE.expire_next_token = False
+            STATE.valid_token = None  # the token the node holds is now stale
+        if not self._authorised():
+            return self._reply(401, {"success": False, "error": {"message": "Invalid token", "code": "UNAUTHORIZED"}})
+        payload = json.loads(body or "{}")
+        if self.path == f"/v1/databanks/{DATABANK}/files":
+            files = [{"key": key, "size": len(data), "lastModified": "2026-10-26T00:00:00Z"} for key, data in STATE.files.items()]
+            return self._reply(200, {"success": True, "data": {"files": files, "directories": []}})
+        if self.path == f"/v1/databanks/{DATABANK}/files/download":
+            key = payload.get("key")
+            if key not in STATE.files:
+                return self._reply(404, {"success": False, "error": {"message": "not found", "code": "RESOURCE_NOT_FOUND"}})
+            port = self.server.server_port
+            return self._reply(200, {"success": True, "data": {"presignedUrl": f"http://127.0.0.1:{port}/blob/{urllib.parse.quote(key)}", "expiresAt": "x"}})
+        if f"/databanks/" in self.path and self.path.endswith("/files"):
+            return self._reply(200, {"success": True, "data": {"files": [], "directories": []}})  # some other, empty databank
+        return self._reply(404, {})
+
+    def do_GET(self):
+        if not self.path.startswith("/blob/"):
+            return self._reply(404, {})
+        key = urllib.parse.unquote(self.path[len("/blob/"):])
+        if STATE.link_expired or key not in STATE.files:
+            return self._reply(403, {"message": "expired"})
+        data = STATE.files[key]
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class FakeOutput:
+    path = "s3://artifacts/x/result.parquet"
+
+    def __init__(self):
+        self.uploaded = None
+
+    def upload_file(self, path):
+        with open(path, "rb") as handle:
+            self.uploaded = handle.read()
+
+
+class FakeContext:
+    def __init__(self, config, output):
+        self.config = config
+        self.outputs = [output]
+
+
+def rows_of(parquet_bytes):
+    with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+        tmp.write(parquet_bytes)
+        tmp.flush()
+        return duckdb.sql(f"SELECT * FROM read_parquet('{tmp.name}') ORDER BY 1").fetchall()
+
+
+class NodeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.server = HTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.server.server_port}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+
+    def setUp(self):
+        STATE.reset()
+        self.secrets = {"PLATFORM_USERNAME": USER, "PLATFORM_PASSWORD": PASSWORD}
+        self.asked_for = []
+
+        def fake_post_json(url, payload, **kwargs):
+            self.asked_for.append(payload["name"])
+            if payload["name"] not in self.secrets:
+                raise util.ApiError("not found", status=404, detail="")
+            return {"value": self.secrets[payload["name"]]}
+
+        for patch in (
+            mock.patch.object(util, "post_json", fake_post_json),
+            mock.patch.dict(os.environ, {"BACKEND_URL": "http://backend.invalid", "API_KEY": "test-key"}),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+        self.workdir = tempfile.mkdtemp()
+
+    def run_node(self, **config):
+        config = {"databank_id": DATABANK, "file_server_url": f"{self.base}/v1", "token_url": f"{self.base}/auth/realms/iudx/protocol/openid-connect/token", **config}
+        output = FakeOutput()
+        captured = io.StringIO()
+        try:
+            with redirect_stdout(captured):
+                result = main.handler(FakeContext(config, output), self.workdir)
+        finally:
+            self.output_text = captured.getvalue()
+        return result, output
+
+    # -- the normal path ---------------------------------------------------------
+    def test_single_csv_becomes_parquet(self):
+        result, output = self.run_node()
+        self.assertEqual(rows_of(output.uploaded), [(1, "Asha", 34), (2, "Ravi", 41), (3, "Meera", 29)])
+        self.assertEqual(result["rows"], 3)
+        self.assertEqual(result["file"], "people.csv")
+
+    def test_file_key_picks_one_of_several(self):
+        STATE.files = {"a/people.csv": CSV, "b/places.jsonl": JSONL}
+        result, output = self.run_node(file_key="b/places.jsonl")
+        self.assertEqual(rows_of(output.uploaded), [(1, "Bengaluru"), (2, "Mysuru")])
+
+    def test_a_parquet_file_is_kept_as_it_is(self):
+        with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+            duckdb.sql(f"COPY (SELECT 7 AS n) TO '{tmp.name}' (FORMAT PARQUET)")
+        with open(tmp.name, "rb") as handle:
+            STATE.files = {"nums.parquet": handle.read()}
+        os.unlink(tmp.name)
+        _, output = self.run_node()
+        self.assertEqual(rows_of(output.uploaded), [(7,)])
+
+    def test_the_secret_names_can_be_changed(self):
+        self.secrets = {"MY_USER": USER, "MY_PASS": PASSWORD}
+        self.run_node(username_secret="MY_USER", password_secret="MY_PASS")
+        self.assertEqual(self.asked_for, ["MY_USER", "MY_PASS"])
+
+    # -- the token expires mid-run ------------------------------------------------
+    def test_an_expired_token_triggers_one_new_login(self):
+        STATE.expire_next_token = True
+        _, output = self.run_node()
+        self.assertEqual(STATE.tokens_issued, 2)
+        self.assertEqual(len(rows_of(output.uploaded)), 3)
+
+    # -- problems the user must be told about -------------------------------------
+    def test_wrong_password_is_a_clear_error_without_leaking_it(self):
+        self.secrets["PLATFORM_PASSWORD"] = "wrong-password-123"
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        self.assertIn("Could not log in", str(caught.exception))
+        self.assertNotIn("wrong-password-123", str(caught.exception) + self.output_text)
+
+    def test_missing_secret_is_a_clear_error(self):
+        del self.secrets["PLATFORM_USERNAME"]
+        with self.assertRaises(Exception) as caught:
+            self.run_node()
+        self.assertIn("PLATFORM_USERNAME", str(caught.exception))
+
+    def test_a_dataset_with_no_files_says_so(self):
+        STATE.files = {}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        self.assertIn("no files", str(caught.exception))
+
+    def test_several_files_without_a_choice_lists_them(self):
+        STATE.files = {"a.csv": CSV, "b.csv": CSV}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        message = str(caught.exception)
+        self.assertIn("a.csv", message)
+        self.assertIn("b.csv", message)
+
+    def test_a_wrong_file_key_lists_what_exists(self):
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node(file_key="nope.csv")
+        self.assertIn("people.csv", str(caught.exception))
+
+    def test_an_unsupported_file_type_is_refused(self):
+        STATE.files = {"map.gpkg": b"not really a geopackage"}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        self.assertIn("not supported", str(caught.exception))
+
+    def test_an_expired_download_link_is_explained(self):
+        STATE.link_expired = True
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        self.assertIn("expired", str(caught.exception))
+
+    def test_a_databank_id_is_required(self):
+        with self.assertRaises(main.PlatformError):
+            self.run_node(databank_id="")
+
+    # -- nothing sensitive in the log -----------------------------------------------
+    def test_neither_password_nor_token_is_logged(self):
+        self.run_node()
+        self.assertNotIn(PASSWORD, self.output_text)
+        self.assertNotIn("token-1", self.output_text)
+
+
+if __name__ == "__main__":
+    unittest.main()
