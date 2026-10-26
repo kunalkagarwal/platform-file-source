@@ -2,7 +2,7 @@
   "name": "Platform File Source Image",
   "description": "Logs in as you, downloads one file from a platform dataset through the file server and writes it as Parquet",
   "githubUrl": "https://github.com/kunalkagarwal/platform-file-source",
-  "githubRef": "feat/platform-file-source",
+  "githubRef": "main",
   "dockerfilePath": "Dockerfile",
   "dockerContext": "."
 }
