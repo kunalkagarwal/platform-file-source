@@ -205,6 +205,17 @@ class NodeTests(unittest.TestCase):
         self.run_node(username_secret="MY_USER", password_secret="MY_PASS")
         self.assertEqual(self.asked_for, ["MY_USER", "MY_PASS"])
 
+    def test_stray_whitespace_in_the_secrets_is_ignored(self):
+        self.secrets = {"PLATFORM_USERNAME": f"  {USER}\n", "PLATFORM_PASSWORD": f"{PASSWORD}\r\n"}
+        _, output = self.run_node()
+        self.assertEqual(len(rows_of(output.uploaded)), 3)
+
+    def test_a_username_that_is_not_an_email_is_flagged(self):
+        self.secrets["PLATFORM_USERNAME"] = "someone"
+        with self.assertRaises(main.PlatformError):
+            self.run_node()
+        self.assertIn("does not look like an email", self.output_text)
+
     # -- the token expires mid-run ------------------------------------------------
     def test_an_expired_token_triggers_one_new_login(self):
         STATE.expire_next_token = True

@@ -27,7 +27,7 @@ import duckdb
 from pipeline_sdk import context, env
 from pipeline_sdk.context import log
 
-NODE_VERSION = "2026-10-26.1"
+NODE_VERSION = "2026-10-27.1"
 
 DEFAULT_TOKEN_URL = "https://platform.iudx.io/auth/realms/iudx/protocol/openid-connect/token"
 DEFAULT_FILE_SERVER = "https://platform.iudx.io/files-connect-api/v1"
@@ -224,8 +224,11 @@ def handler(ctx: context.NodeContext, workdir: str):
     file_server = _text(ctx.config, "file_server_url", DEFAULT_FILE_SERVER)
 
     log(f"Reading the secrets '{username_secret}' and '{password_secret}'")
-    username = env.get_secret(username_secret)
-    password = env.get_secret(password_secret)
+    # A stray space or line break from copy and paste would make the login fail without being visible.
+    username = env.get_secret(username_secret).strip()
+    password = env.get_secret(password_secret).rstrip("\r\n")
+    if "@" not in username:
+        log(f"Note: the secret '{username_secret}' does not look like an email address")
 
     log(f"Logging in to the platform as the user in '{username_secret}'")
     server = FileServer(file_server, token_url, username, password)
