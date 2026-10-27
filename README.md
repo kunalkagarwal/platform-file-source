@@ -14,7 +14,7 @@ so the next nodes (SQL, Superset, ...) can use it.
    - **File path in the dataset** – needed only when the dataset has more than one file.
 3. Run. The output is `result.parquet`.
 
-Supported files: CSV, JSON / JSON-lines, Parquet. Other types (for example GeoPackage) give a
+Supported files: CSV, JSON / JSON-lines, GeoJSON (each feature becomes a row, its shape in a `geometry` text column), Parquet. Other types (for example GeoPackage) give a
 clear "not supported yet" error. Files larger than 2 GB are refused.
 
 ## What it does

@@ -31,6 +31,10 @@ import main  # noqa: E402
 USER, PASSWORD = "tester@example.org", "s3cret-Pass!word"
 DATABANK = "11111111-2222-3333-4444-555555555555"
 CSV = b"id,name,age\n1,Asha,34\n2,Ravi,41\n3,Meera,29\n"
+GEOJSON = json.dumps({"type": "FeatureCollection", "features": [
+    {"type": "Feature", "properties": {"name": "Fort", "geometry": "x"}, "geometry": {"type": "Point", "coordinates": [78.04, 27.18]}},
+    {"type": "Feature", "properties": {"name": "Gate", "height": 4}, "geometry": None},
+]}).encode()
 JSONL = b'{"id":1,"city":"Bengaluru"}\n{"id":2,"city":"Mysuru"}\n'
 
 
@@ -199,6 +203,21 @@ class NodeTests(unittest.TestCase):
         os.unlink(tmp.name)
         _, output = self.run_node()
         self.assertEqual(rows_of(output.uploaded), [(7,)])
+
+    def test_a_geojson_file_becomes_rows_with_a_geometry_column(self):
+        STATE.files = {"places.geojson": GEOJSON}
+        _, output = self.run_node()
+        with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+            tmp.write(output.uploaded)
+            tmp.flush()
+            rows = duckdb.sql(f"SELECT name, height, properties_geometry, geometry FROM read_parquet('{tmp.name}') ORDER BY name").fetchall()
+        self.assertEqual(rows, [("Fort", None, "x", '{"type":"Point","coordinates":[78.04,27.18]}'), ("Gate", 4, None, None)])
+
+    def test_a_file_that_is_not_geojson_is_refused(self):
+        STATE.files = {"bad.geojson": b'{"type": "Banana"}'}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        self.assertIn("not a GeoJSON", str(caught.exception))
 
     def test_the_secret_names_can_be_changed(self):
         self.secrets = {"MY_USER": USER, "MY_PASS": PASSWORD}

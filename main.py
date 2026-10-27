@@ -27,7 +27,7 @@ import duckdb
 from pipeline_sdk import context, env
 from pipeline_sdk.context import log
 
-NODE_VERSION = "2026-10-27.1"
+NODE_VERSION = "2026-10-27.2"
 
 DEFAULT_TOKEN_URL = "https://platform.iudx.io/auth/realms/iudx/protocol/openid-connect/token"
 DEFAULT_FILE_SERVER = "https://platform.iudx.io/files-connect-api/v1"
@@ -38,7 +38,8 @@ DEFAULT_PASSWORD_SECRET = "PLATFORM_PASSWORD"
 
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # refuse anything bigger than 2 GiB
 LIST_LIMIT = 1000
-SUPPORTED_EXTENSIONS = (".csv", ".json", ".jsonl", ".ndjson", ".parquet")
+SUPPORTED_EXTENSIONS = (".csv", ".json", ".jsonl", ".ndjson", ".geojson", ".parquet")
+MAX_GEOJSON_BYTES = 500 * 1024 * 1024  # a GeoJSON file is read into memory, so it has a lower limit
 
 
 class PlatformError(Exception):
@@ -178,8 +179,43 @@ def download(link, destination):
     return size
 
 
+def geojson_to_rows(source, destination):
+    """Turn a GeoJSON file into one JSON line per feature: the feature's properties as columns
+    plus a `geometry` column that holds the shape as GeoJSON text."""
+    if os.path.getsize(source) > MAX_GEOJSON_BYTES:
+        raise PlatformError("This GeoJSON file is larger than 500 MB, which this node does not load.")
+    try:
+        with open(source, encoding="utf-8-sig") as handle:
+            document = json.load(handle)
+    except ValueError as error:
+        raise PlatformError(f"The file is not valid GeoJSON: {error}") from error
+    kind = document.get("type") if isinstance(document, dict) else None
+    if kind == "FeatureCollection":
+        features = document.get("features") or []
+    elif kind == "Feature":
+        features = [document]
+    else:
+        raise PlatformError("The file is not a GeoJSON FeatureCollection or Feature.")
+    with open(destination, "w", encoding="utf-8") as out:
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
+            row = dict(feature.get("properties") or {})
+            if "geometry" in row:
+                row["properties_geometry"] = row.pop("geometry")
+            geometry = feature.get("geometry")
+            row["geometry"] = json.dumps(geometry, separators=(",", ":")) if geometry is not None else None
+            out.write(json.dumps(row) + "\n")
+    return len(features)
+
+
 def to_parquet(source, extension, destination):
     """Write `source` as Parquet at `destination`; returns the row count."""
+    if extension == ".geojson":
+        lines = source + ".rows.jsonl"
+        if geojson_to_rows(source, lines) == 0:
+            raise PlatformError("The GeoJSON file has no features.")
+        source, extension = lines, ".jsonl"
     if extension == ".parquet":
         shutil.copyfile(source, destination)
         reader = "read_parquet"
@@ -198,8 +234,9 @@ def to_parquet(source, extension, destination):
         if extension != ".parquet":
             escaped_destination = destination.replace("'", "''")
             try:
+                options = ", sample_size=-1" if reader == "read_json_auto" else ""
                 connection.execute(
-                    f"COPY (SELECT * FROM {reader}('{escaped_source}')) TO '{escaped_destination}' (FORMAT PARQUET)"
+                    f"COPY (SELECT * FROM {reader}('{escaped_source}'{options})) TO '{escaped_destination}' (FORMAT PARQUET)"
                 )
             except duckdb.Error as error:
                 raise PlatformError(f"The file could not be read as {extension[1:].upper()}: {error}") from error
