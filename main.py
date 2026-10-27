@@ -27,7 +27,7 @@ import duckdb
 from pipeline_sdk import context, env
 from pipeline_sdk.context import log
 
-NODE_VERSION = "2026-10-27.2"
+NODE_VERSION = "2026-10-27.3"
 
 DEFAULT_TOKEN_URL = "https://platform.iudx.io/auth/realms/iudx/protocol/openid-connect/token"
 DEFAULT_FILE_SERVER = "https://platform.iudx.io/files-connect-api/v1"
@@ -179,6 +179,13 @@ def download(link, destination):
     return size
 
 
+def looks_like_geojson(path):
+    """True when the start of a .json file says it is a GeoJSON FeatureCollection or Feature."""
+    with open(path, "rb") as handle:
+        head = handle.read(4096).decode("utf-8", errors="ignore")
+    return '"FeatureCollection"' in head or ('"Feature"' in head and '"geometry"' in head)
+
+
 def geojson_to_rows(source, destination):
     """Turn a GeoJSON file into one JSON line per feature: the feature's properties as columns
     plus a `geometry` column that holds the shape as GeoJSON text."""
@@ -211,6 +218,8 @@ def geojson_to_rows(source, destination):
 
 def to_parquet(source, extension, destination):
     """Write `source` as Parquet at `destination`; returns the row count."""
+    if extension == ".json" and looks_like_geojson(source):
+        extension = ".geojson"  # GeoJSON saved with a plain .json name
     if extension == ".geojson":
         lines = source + ".rows.jsonl"
         if geojson_to_rows(source, lines) == 0:

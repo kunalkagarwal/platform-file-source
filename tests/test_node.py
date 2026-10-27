@@ -213,6 +213,16 @@ class NodeTests(unittest.TestCase):
             rows = duckdb.sql(f"SELECT name, height, properties_geometry, geometry FROM read_parquet('{tmp.name}') ORDER BY name").fetchall()
         self.assertEqual(rows, [("Fort", None, "x", '{"type":"Point","coordinates":[78.04,27.18]}'), ("Gate", 4, None, None)])
 
+    def test_geojson_with_a_plain_json_name_is_read_as_geojson(self):
+        STATE.files = {"places.json": GEOJSON}
+        result, _ = self.run_node()
+        self.assertEqual(result["rows"], 2)
+
+    def test_ordinary_json_is_not_mistaken_for_geojson(self):
+        STATE.files = {"rows.json": b'[{"id": 1, "kind": "Feature"}, {"id": 2, "kind": "Other"}]'}
+        result, _ = self.run_node()
+        self.assertEqual(result["rows"], 2)
+
     def test_a_file_that_is_not_geojson_is_refused(self):
         STATE.files = {"bad.geojson": b'{"type": "Banana"}'}
         with self.assertRaises(main.PlatformError) as caught:
