@@ -270,6 +270,20 @@ class NodeTests(unittest.TestCase):
         self.assertEqual(columns[-1], "_source_file")
         self.assertEqual({row[-1] for row in rows}, {"d/a1.csv", "d/a2.csv"})
 
+    def test_parquet_files_can_be_stacked(self):
+        files = {}
+        for index in range(3):
+            with tempfile.NamedTemporaryFile(suffix=".parquet", delete=False) as tmp:
+                duckdb.sql(f"COPY (SELECT {index} AS n, 'x' AS tag) TO '{tmp.name}' (FORMAT PARQUET)")
+            with open(tmp.name, "rb") as handle:
+                files[f"part{index}.parquet"] = handle.read()
+            os.unlink(tmp.name)
+        STATE.files = files
+        result, output = self.run_node(all_files=True)
+        rows, columns = self.table(output)
+        self.assertEqual([row[0] for row in rows], [0, 1, 2])
+        self.assertEqual(columns, ["n", "tag", "_source_file"])
+
     def test_a_folder_prefix_picks_the_files_in_it(self):
         STATE.files = {"in/a.csv": CSV, "out/b.csv": CSV}
         result, _ = self.run_node(all_files=True, file_key="in/")

@@ -28,7 +28,7 @@ import duckdb
 from pipeline_sdk import context, env
 from pipeline_sdk.context import log
 
-NODE_VERSION = "2026-10-28.1"
+NODE_VERSION = "2026-10-28.2"
 
 DEFAULT_TOKEN_URL = "https://platform.iudx.io/auth/realms/iudx/protocol/openid-connect/token"
 DEFAULT_FILE_SERVER = "https://platform.iudx.io/files-connect-api/v1"
@@ -439,7 +439,7 @@ def handler(ctx: context.NodeContext, workdir: str):
         for index, item in enumerate(chosen, start=1):
             key = item["key"]
             extension = os.path.splitext(key)[1].lower()
-            raw_path = os.path.join(workdir, f"part_{index}{extension}")
+            raw_path = os.path.join(workdir, f"raw_{index}{extension}")
             part_path = os.path.join(workdir, f"part_{index}.parquet")
             size += download(server.download_link(databank_id, key), raw_path)
             if size > MAX_DOWNLOAD_BYTES:
