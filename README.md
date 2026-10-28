@@ -14,8 +14,14 @@ so the next nodes (SQL, Superset, ...) can use it.
    - **File path in the dataset** – needed only when the dataset has more than one file.
 3. Run. The output is `result.parquet`.
 
-Supported files: CSV, JSON / JSON-lines, GeoJSON (each feature becomes a row, its shape in a `geometry` text column), Parquet. Other types (for example GeoPackage) give a
-clear "not supported yet" error. Files larger than 2 GB are refused.
+Supported files: CSV, JSON / JSON-lines, GeoJSON, GeoPackage (`.gpkg`) and Parquet. For the map formats each feature becomes
+a row and its shape goes into a `geometry` column as GeoJSON text in WGS84 (longitude, latitude); a GeoPackage in another
+coordinate system is converted. A GeoPackage with several layers needs the **Layer name** field. Other types give a clear
+"not supported yet" error. Files larger than 2 GB are refused (500 MB for one GeoJSON file).
+
+**Many files:** turn on **Load all matching files**. The file path then works as a pattern (`2026-09-*.parquet`, `data/*.csv`)
+or a folder (`data/`); empty means every file. The files are stacked into one table (columns matched by name) with an extra
+`_source_file` column. **Most files to load** (default 500) stops runaway selections.
 
 ## What it does
 
@@ -36,7 +42,10 @@ The password and token are never logged or written to the output.
 |---|---|---|
 | `name` | yes | Node name (snake_case) |
 | `databank_id` | yes | Dataset id |
-| `file_key` | no | File path inside the dataset |
+| `file_key` | no | File path inside the dataset (a pattern or folder when `all_files` is on) |
+| `all_files` | no | Load every matching file into one table |
+| `max_files` | no | Safety limit for `all_files` (default 500) |
+| `layer` | no | GeoPackage layer name, needed when the file has several |
 | `username_secret` / `password_secret` | no | Names of the secrets (defaults above) |
 | `file_server_url` / `token_url` | no | Override the platform addresses (for other deployments) |
 

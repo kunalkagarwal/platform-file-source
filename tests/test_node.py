@@ -135,6 +135,37 @@ class FakeContext:
         self.outputs = [output]
 
 
+def make_gpkg(layers):
+    """A real GeoPackage as bytes. layers: {name: (srs, point_sql)}; every extra layer is copied in with sqlite."""
+    import sqlite3
+    path = os.path.join(tempfile.mkdtemp(), "t.gpkg")
+    connection = duckdb.connect()
+    connection.execute("INSTALL spatial")
+    connection.execute("LOAD spatial")
+    names = list(layers)
+    first = names[0]
+    srs, point = layers[first]
+    connection.execute(
+        f"COPY (SELECT 1 AS id, 'Fort' AS name, {point} AS geom) TO '{path}' "
+        f"(FORMAT GDAL, DRIVER 'GPKG', LAYER_NAME '{first}', SRS '{srs}')"
+    )
+    connection.close()
+    if len(names) > 1:
+        db = sqlite3.connect(path)
+        for extra in names[1:]:
+            db.execute(f'CREATE TABLE "{extra}" AS SELECT * FROM "{first}"')
+            db.execute(
+                "INSERT INTO gpkg_contents SELECT ?, data_type, ?, description, last_change, min_x, min_y, max_x, max_y, srs_id "
+                "FROM gpkg_contents WHERE table_name = ?", (extra, extra, first))
+            db.execute(
+                "INSERT INTO gpkg_geometry_columns SELECT ?, column_name, geometry_type_name, srs_id, z, m "
+                "FROM gpkg_geometry_columns WHERE table_name = ?", (extra, first))
+        db.commit()
+        db.close()
+    with open(path, "rb") as handle:
+        return handle.read()
+
+
 def rows_of(parquet_bytes):
     with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
         tmp.write(parquet_bytes)
@@ -223,6 +254,93 @@ class NodeTests(unittest.TestCase):
         result, _ = self.run_node()
         self.assertEqual(result["rows"], 2)
 
+    # -- all matching files ------------------------------------------------------
+    def table(self, output):
+        with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+            tmp.write(output.uploaded)
+            tmp.flush()
+            return duckdb.sql(f"SELECT * FROM read_parquet('{tmp.name}') ORDER BY 1, 2").fetchall(), \
+                [column[0] for column in duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{tmp.name}')").fetchall()]
+
+    def test_all_matching_files_are_stacked_with_their_source(self):
+        STATE.files = {"d/a1.csv": CSV, "d/a2.csv": CSV, "d/other.jsonl": JSONL}
+        result, output = self.run_node(all_files=True, file_key="d/a*.csv")
+        rows, columns = self.table(output)
+        self.assertEqual(result["rows"], 6)
+        self.assertEqual(columns[-1], "_source_file")
+        self.assertEqual({row[-1] for row in rows}, {"d/a1.csv", "d/a2.csv"})
+
+    def test_a_folder_prefix_picks_the_files_in_it(self):
+        STATE.files = {"in/a.csv": CSV, "out/b.csv": CSV}
+        result, _ = self.run_node(all_files=True, file_key="in/")
+        self.assertEqual(result["rows"], 3)
+
+    def test_all_files_with_no_pattern_takes_everything_and_mixed_types_work(self):
+        STATE.files = {"a.csv": CSV, "b.jsonl": JSONL}
+        result, output = self.run_node(all_files=True)
+        rows, columns = self.table(output)
+        self.assertEqual(result["rows"], 5)
+        self.assertEqual(set(columns), {"id", "name", "age", "city", "_source_file"})
+
+    def test_many_files_are_loaded(self):
+        STATE.files = {f"p{index:03}.csv": CSV for index in range(120)}
+        result, _ = self.run_node(all_files=True)
+        self.assertEqual(result["rows"], 360)
+
+    def test_too_many_matching_files_stops_with_a_message(self):
+        STATE.files = {f"p{index}.csv": CSV for index in range(5)}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node(all_files=True, max_files=3)
+        self.assertIn("more than the limit of 3", str(caught.exception))
+
+    def test_a_pattern_that_matches_nothing_lists_the_files(self):
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node(all_files=True, file_key="zzz*")
+        self.assertIn("people.csv", str(caught.exception))
+
+    def test_a_pattern_without_the_switch_explains_itself(self):
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node(file_key="*.csv")
+        self.assertIn("Load all matching files", str(caught.exception))
+
+    def test_a_bad_file_among_many_is_named(self):
+        STATE.files = {"a.csv": CSV, "b.gpkg": b"not a geopackage"}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node(all_files=True)
+        self.assertIn("'b.gpkg'", str(caught.exception))
+
+    # -- GeoPackage ----------------------------------------------------------------
+    def test_a_geopackage_becomes_rows_with_wgs84_geojson(self):
+        STATE.files = {"places.gpkg": make_gpkg({"places": ("EPSG:4326", "ST_Point(78.04, 27.18)")})}
+        result, output = self.run_node()
+        rows, columns = self.table(output)
+        self.assertEqual(rows, [(1, "Fort", '{"type":"Point","coordinates":[78.04,27.18]}')])
+        self.assertEqual(columns, ["id", "name", "geometry"])
+
+    def test_a_projected_geopackage_is_converted_to_longitude_latitude(self):
+        STATE.files = {"utm.gpkg": make_gpkg({"places": ("EPSG:32643", "ST_Point(500000, 3000000)")})}
+        _, output = self.run_node()
+        rows, _ = self.table(output)
+        longitude, latitude = json.loads(rows[0][2])["coordinates"]
+        self.assertAlmostEqual(longitude, 75.0, places=1)  # the central meridian of zone 43
+        self.assertAlmostEqual(latitude, 27.1, places=0)
+        self.assertIn("EPSG:32643", self.output_text)
+
+    def test_a_geopackage_with_several_layers_needs_a_choice(self):
+        STATE.files = {"two.gpkg": make_gpkg({"places": ("EPSG:4326", "ST_Point(1, 2)"), "roads": ("EPSG:4326", "ST_Point(1, 2)")})}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node()
+        self.assertIn("places", str(caught.exception))
+        self.assertIn("roads", str(caught.exception))
+        result, _ = self.run_node(layer="roads")
+        self.assertEqual(result["rows"], 1)
+
+    def test_a_wrong_layer_name_lists_the_layers(self):
+        STATE.files = {"one.gpkg": make_gpkg({"places": ("EPSG:4326", "ST_Point(1, 2)")})}
+        with self.assertRaises(main.PlatformError) as caught:
+            self.run_node(layer="nope")
+        self.assertIn("places", str(caught.exception))
+
     def test_a_file_that_is_not_geojson_is_refused(self):
         STATE.files = {"bad.geojson": b'{"type": "Banana"}'}
         with self.assertRaises(main.PlatformError) as caught:
@@ -286,7 +404,7 @@ class NodeTests(unittest.TestCase):
         self.assertIn("people.csv", str(caught.exception))
 
     def test_an_unsupported_file_type_is_refused(self):
-        STATE.files = {"map.gpkg": b"not really a geopackage"}
+        STATE.files = {"map.shp": b"not supported"}
         with self.assertRaises(main.PlatformError) as caught:
             self.run_node()
         self.assertIn("not supported", str(caught.exception))

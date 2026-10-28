@@ -16,6 +16,7 @@ The password and the token are never logged. The password and username are
 also registered for log masking by the SDK when fetched.
 """
 
+import fnmatch
 import json
 import os
 import shutil
@@ -27,7 +28,7 @@ import duckdb
 from pipeline_sdk import context, env
 from pipeline_sdk.context import log
 
-NODE_VERSION = "2026-10-27.3"
+NODE_VERSION = "2026-10-28.1"
 
 DEFAULT_TOKEN_URL = "https://platform.iudx.io/auth/realms/iudx/protocol/openid-connect/token"
 DEFAULT_FILE_SERVER = "https://platform.iudx.io/files-connect-api/v1"
@@ -38,7 +39,9 @@ DEFAULT_PASSWORD_SECRET = "PLATFORM_PASSWORD"
 
 MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024  # refuse anything bigger than 2 GiB
 LIST_LIMIT = 1000
-SUPPORTED_EXTENSIONS = (".csv", ".json", ".jsonl", ".ndjson", ".geojson", ".parquet")
+SUPPORTED_EXTENSIONS = (".csv", ".json", ".jsonl", ".ndjson", ".geojson", ".gpkg", ".parquet")
+DEFAULT_MAX_FILES = 500
+SPATIAL_EXTENSION_DIR = "/opt/duckdb_extensions"  # where the Dockerfile installs the spatial add-on
 MAX_GEOJSON_BYTES = 500 * 1024 * 1024  # a GeoJSON file is read into memory, so it has a lower limit
 
 
@@ -216,8 +219,140 @@ def geojson_to_rows(source, destination):
     return len(features)
 
 
-def to_parquet(source, extension, destination):
+def load_spatial(connection):
+    """Load DuckDB's spatial add-on (installed into the image at build time)."""
+    try:
+        if os.path.isdir(SPATIAL_EXTENSION_DIR):
+            connection.execute(f"SET extension_directory='{SPATIAL_EXTENSION_DIR}'")
+        connection.execute("LOAD spatial")
+    except duckdb.Error:
+        try:
+            connection.execute("INSTALL spatial")
+            connection.execute("LOAD spatial")
+        except duckdb.Error as error:
+            raise PlatformError(f"GeoPackage support is not available in this image: {error}") from error
+
+
+def _quote(name):
+    return '"' + name.replace('"', '""') + '"'
+
+
+def gpkg_to_parquet(connection, source, layer, destination):
+    """Write one GeoPackage layer as Parquet: attribute columns as they are, plus a `geometry` column
+    holding the shape as GeoJSON text in WGS84 (longitude, latitude), like the GeoJSON files."""
+    load_spatial(connection)
+    escaped = source.replace("'", "''")
+    try:
+        row = connection.execute(f"SELECT layers FROM ST_Read_Meta('{escaped}')").fetchone()
+    except duckdb.Error as error:
+        raise PlatformError(f"The file could not be read as a GeoPackage: {error}") from error
+    if row is None:
+        raise PlatformError("The file could not be read as a GeoPackage.")
+    layers = row[0] or []
+    names = [item["name"] for item in layers]
+    if not names:
+        raise PlatformError("The GeoPackage has no layers.")
+    if layer:
+        if layer not in names:
+            raise PlatformError(f"No layer '{layer}' in the GeoPackage. Layers found: {', '.join(names)}")
+    elif len(names) > 1:
+        raise PlatformError(
+            f"The GeoPackage has {len(names)} layers, so say which one to take in 'Layer name'. "
+            f"Layers found: {', '.join(names)}"
+        )
+    else:
+        layer = names[0]
+    info = next(item for item in layers if item["name"] == layer)
+    fields = info.get("geometry_fields") or []
+    escaped_layer = layer.replace("'", "''")
+    escaped_destination = destination.replace("'", "''")
+    read = f"ST_Read('{escaped}', layer='{escaped_layer}')"
+    if fields:
+        geometry_column = fields[0]["name"]
+        crs = fields[0].get("crs") or {}
+        code = f"{crs.get('auth_name')}:{crs.get('auth_code')}" if crs.get("auth_code") else None
+        shape = _quote(geometry_column)
+        if code and code not in ("EPSG:4326", "OGC:CRS84"):
+            log(f"Converting the shapes from {code} to WGS84")
+            shape = f"ST_Transform({shape}, '{code}', 'EPSG:4326', always_xy := true)"
+        elif not code:
+            log("The layer has no coordinate system recorded; assuming the coordinates are already longitude, latitude")
+        query = f"SELECT * EXCLUDE ({_quote(geometry_column)}), ST_AsGeoJSON({shape}) AS geometry FROM {read}"
+    else:
+        query = f"SELECT * FROM {read}"
+    try:
+        connection.execute(f"COPY ({query}) TO '{escaped_destination}' (FORMAT PARQUET)")
+    except duckdb.Error as error:
+        raise PlatformError(f"The GeoPackage layer could not be converted: {error}") from error
+
+
+def add_source_column(path, name):
+    """Add a `_source_file` column to a Parquet file, so rows from several files can be told apart."""
+    connection = duckdb.connect()
+    try:
+        temporary = path + ".tmp"
+        escaped_path, escaped_temporary = path.replace("'", "''"), temporary.replace("'", "''")
+        escaped_name = name.replace("'", "''")
+        connection.execute(
+            f"COPY (SELECT *, '{escaped_name}' AS _source_file FROM read_parquet('{escaped_path}')) "
+            f"TO '{escaped_temporary}' (FORMAT PARQUET)"
+        )
+    finally:
+        connection.close()
+    os.replace(temporary, path)
+
+
+def select_files(files, pattern):
+    """The files a pattern matches: `*` and `?` work, a pattern ending in `/` means a folder, empty means all."""
+    if not pattern:
+        return list(files)
+    wanted = pattern.strip().lstrip("/")
+    if wanted.endswith("/"):
+        return [item for item in files if item["key"].startswith(wanted)]
+    return [item for item in files if fnmatch.fnmatchcase(item["key"], wanted)]
+
+
+def combine_parquet(parts, destination):
+    """Stack many Parquet files into one; columns are matched by name; returns the row count."""
+    connection = duckdb.connect()
+    try:
+        listed = ", ".join("'" + part.replace("'", "''") + "'" for part in parts)
+        escaped_destination = destination.replace("'", "''")
+        try:
+            connection.execute(
+                f"COPY (SELECT * FROM read_parquet([{listed}], union_by_name=true)) "
+                f"TO '{escaped_destination}' (FORMAT PARQUET)"
+            )
+        except duckdb.Error as error:
+            raise PlatformError(f"The files could not be combined (their columns may not fit together): {error}") from error
+        return connection.execute(f"SELECT COUNT(*) FROM read_parquet('{escaped_destination}')").fetchone()[0]
+    finally:
+        connection.close()
+
+
+def _flag(config, name):
+    value = config.get(name)
+    return value is True or str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
+def _number(config, name, default):
+    try:
+        return int(float(config.get(name)))
+    except (TypeError, ValueError):
+        return default
+
+
+def to_parquet(source, extension, destination, layer=None):
     """Write `source` as Parquet at `destination`; returns the row count."""
+    if extension == ".gpkg":
+        connection = duckdb.connect()
+        try:
+            gpkg_to_parquet(connection, source, layer, destination)
+            return connection.execute(
+                f"SELECT COUNT(*) FROM read_parquet('{destination.replace(chr(39), chr(39) * 2)}')"
+            ).fetchone()[0]
+        finally:
+            connection.close()
     if extension == ".json" and looks_like_geojson(source):
         extension = ".geojson"  # GeoJSON saved with a plain .json name
     if extension == ".geojson":
@@ -281,23 +416,66 @@ def handler(ctx: context.NodeContext, workdir: str):
 
     log(f"Listing the files of dataset {databank_id}")
     files = server.list_files(databank_id)
-    chosen = choose_file(files, _text(ctx.config, "file_key"))
-    key = chosen["key"]
-    log(f"Downloading '{key}' ({chosen.get('size', '?')} bytes)")
-
-    extension = os.path.splitext(key)[1].lower()
-    raw_path = os.path.join(workdir, "downloaded" + extension)
-    size = download(server.download_link(databank_id, key), raw_path)
-    log(f"Downloaded {size} bytes")
-
+    if len(files) >= LIST_LIMIT:
+        log(f"Note: the file server lists at most {LIST_LIMIT} files; there may be more in this dataset")
+    pattern = _text(ctx.config, "file_key")
+    layer = _text(ctx.config, "layer") or None
     result_path = os.path.join(workdir, "result.parquet")
-    rows = to_parquet(raw_path, extension, result_path)
-    log(f"Converted to Parquet: {rows} row(s)")
+
+    if _flag(ctx.config, "all_files"):
+        chosen = select_files(files, pattern)
+        if not chosen:
+            names = ", ".join(item["key"] for item in files[:10]) or "none"
+            raise PlatformError(f"No file matches '{pattern}'. Files found: {names}")
+        limit = _number(ctx.config, "max_files", DEFAULT_MAX_FILES)
+        if len(chosen) > limit:
+            raise PlatformError(
+                f"{len(chosen)} files match, which is more than the limit of {limit}. "
+                "Narrow the file pattern, or raise 'Most files to load'."
+            )
+        chosen.sort(key=lambda item: item["key"])
+        log(f"Loading {len(chosen)} file(s)")
+        parts, size = [], 0
+        for index, item in enumerate(chosen, start=1):
+            key = item["key"]
+            extension = os.path.splitext(key)[1].lower()
+            raw_path = os.path.join(workdir, f"part_{index}{extension}")
+            part_path = os.path.join(workdir, f"part_{index}.parquet")
+            size += download(server.download_link(databank_id, key), raw_path)
+            if size > MAX_DOWNLOAD_BYTES:
+                raise PlatformError("The files together are larger than 2 GB, which this node does not load.")
+            try:
+                to_parquet(raw_path, extension, part_path, layer)
+            except PlatformError as error:
+                raise PlatformError(f"'{key}': {error}") from error
+            os.remove(raw_path)
+            add_source_column(part_path, key)
+            parts.append(part_path)
+            if index % 25 == 0 or index == len(chosen):
+                log(f"Downloaded and converted {index} of {len(chosen)} files")
+        rows = combine_parquet(parts, result_path)
+        log(f"Combined {len(parts)} file(s) into one table: {rows} row(s)")
+        label = f"{len(parts)} files"
+    else:
+        if any(mark in pattern for mark in "*?"):
+            raise PlatformError("The file path has a * or ? in it. Turn on 'Load all matching files' to use a pattern.")
+        chosen = choose_file(files, pattern)
+        key = chosen["key"]
+        log(f"Downloading '{key}' ({chosen.get('size', '?')} bytes)")
+
+        extension = os.path.splitext(key)[1].lower()
+        raw_path = os.path.join(workdir, "downloaded" + extension)
+        size = download(server.download_link(databank_id, key), raw_path)
+        log(f"Downloaded {size} bytes")
+
+        rows = to_parquet(raw_path, extension, result_path, layer)
+        log(f"Converted to Parquet: {rows} row(s)")
+        label = key
 
     for out in ctx.outputs:
         log(f"Uploading to {out.path}")
         out.upload_file(result_path)
-    return {"databankId": databank_id, "file": key, "bytes": size, "rows": rows}
+    return {"databankId": databank_id, "file": label, "bytes": size, "rows": rows}
 
 
 if __name__ == "__main__":

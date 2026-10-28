@@ -3,7 +3,7 @@
   "nodeType": "processing",
   "name": "Platform File Source",
   "shortDescription": "Download a file from a platform dataset (databank) and load it into the pipeline as Parquet",
-  "description": "Logs in to the platform with your own account (username and password stored as secrets in Settings, Secrets), downloads one file from a platform dataset's databank through the file server, and writes it as a Parquet file for the next nodes. Supports CSV, JSON and Parquet files. Give the dataset (databank) ID, and the file's path inside it when the databank holds more than one file.",
+  "description": "Logs in to the platform with your own account (username and password stored as secrets in Settings, Secrets), downloads a file from a platform dataset's databank through the file server, and writes it as a Parquet file for the next nodes. Supports CSV, JSON, GeoJSON, GeoPackage and Parquet files (shapes become a geometry column of GeoJSON text). Give the dataset (databank) ID, and the file's path inside it when the databank holds more than one file. Turn on 'Load all matching files' to stack many files into one table.",
   "lucideIcon": "CloudDownload",
   "color": "#0ea5e9",
   "hasInput": false,
@@ -31,10 +31,39 @@
     "file_key": {
       "type": "string",
       "label": "File path in the dataset",
-      "description": "Which file to download, for example data/people.csv. Leave empty if the dataset has exactly one file.",
+      "description": "Which file to download, for example data/people.csv. Leave empty if the dataset has exactly one file. With 'Load all matching files' on, this can be a pattern such as 2026-09-*.parquet, or a folder ending in /.",
       "required": false,
       "unique": false,
       "placeholder": "e.g. data/people.csv"
+    },
+    "all_files": {
+      "type": "boolean",
+      "label": "Load all matching files",
+      "description": "Turn on to load every file that matches the file path pattern (or every file, if the pattern is empty) and stack them into one table with an extra _source_file column.",
+      "required": false,
+      "unique": false,
+      "default": false
+    },
+    "max_files": {
+      "type": "number",
+      "label": "Most files to load",
+      "description": "Safety limit used with 'Load all matching files'. The node stops with a message if more files match.",
+      "required": false,
+      "unique": false,
+      "default": 500,
+      "validation": {
+        "minimum": 1,
+        "maximum": 2000,
+        "integer": true
+      }
+    },
+    "layer": {
+      "type": "string",
+      "label": "Layer name (GeoPackage)",
+      "description": "Only for GeoPackage (.gpkg) files that hold more than one layer: which layer to load. The error message lists the layer names.",
+      "required": false,
+      "unique": false,
+      "placeholder": "e.g. roads"
     },
     "username_secret": {
       "type": "string",
